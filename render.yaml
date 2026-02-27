@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ksef-token-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn ksef_server:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: API_KEY
+        generateValue: true
+    plan: free
