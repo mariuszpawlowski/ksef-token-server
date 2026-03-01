@@ -32,6 +32,10 @@ import base64
 import requests as http_requests
 import time
 import os
+import re
+import xml.etree.ElementTree as ET
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import date
 
 app = Flask(__name__)
 
@@ -234,6 +238,301 @@ def ksef_refresh():
         return jsonify({"error": str(e)}), 500
 
 
+# =============================================================
+#  KSeF XML → Elixir-0 (mBank) — funkcje pomocnicze
+# =============================================================
+
+def _xml_find(root, path, default=""):
+    """Wyszukuje tekst elementu XML (po usunięciu namespace)."""
+    el = root.find(path)
+    return el.text.strip() if el is not None and el.text else default
+
+
+def _strip_namespaces(xml_string):
+    """Parsuje XML i usuwa namespace z tagów dla łatwiejszego XPath."""
+    root = ET.fromstring(xml_string)
+    for el in root.iter():
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+        # Usuń też namespace z atrybutów
+        new_attrib = {}
+        for k, v in el.attrib.items():
+            if "}" in k:
+                k = k.split("}", 1)[1]
+            new_attrib[k] = v
+        el.attrib = new_attrib
+    return root
+
+
+def _parse_ksef_invoice(xml_string):
+    """
+    Parsuje fakturę KSeF FA(2) i wyciąga dane potrzebne do Elixir-0.
+
+    Podmiot1 = Sprzedawca (wystawca faktury) → odbiorca przelewu
+    Podmiot2 = Nabywca (kupujący)            → nadawca przelewu
+    """
+    root = _strip_namespaces(xml_string)
+
+    # --- Sprzedawca (Podmiot1) = odbiorca przelewu ---
+    seller_nip = _xml_find(root, ".//Podmiot1/DaneIdentyfikacyjne/NIP")
+    seller_name = _xml_find(root, ".//Podmiot1/DaneIdentyfikacyjne/Nazwa")
+    seller_addr1 = _xml_find(root, ".//Podmiot1/Adres/AdresL1")
+    seller_addr2 = _xml_find(root, ".//Podmiot1/Adres/AdresL2")
+
+    # --- Nabywca (Podmiot2) = nadawca przelewu ---
+    buyer_nip = _xml_find(root, ".//Podmiot2/DaneIdentyfikacyjne/NIP")
+    buyer_name = _xml_find(root, ".//Podmiot2/DaneIdentyfikacyjne/Nazwa")
+    buyer_addr1 = _xml_find(root, ".//Podmiot2/Adres/AdresL1")
+    buyer_addr2 = _xml_find(root, ".//Podmiot2/Adres/AdresL2")
+
+    # --- Dane faktury ---
+    invoice_number = _xml_find(root, ".//Fa/P_2")
+    invoice_date = _xml_find(root, ".//Fa/P_1")
+    gross_total = _xml_find(root, ".//Fa/P_15", "0")
+
+    # Termin płatności
+    due_date = _xml_find(root, ".//Fa/Platnosc/TerminPlatnosci/Termin")
+
+    # Rachunek bankowy sprzedawcy (odbiorca przelewu)
+    seller_account = _xml_find(root, ".//Fa/Platnosc/RachunekBankowy/NrRB")
+
+    # MPP – mechanizm podzielonej płatności
+    # P_18A: "1" = MPP obowiązkowy, "2" = brak MPP
+    mpp_flag = _xml_find(root, ".//Fa/Adnotacje/P_18A", "2")
+    is_split_payment = (mpp_flag == "1")
+
+    # Suma VAT = P_14_1 + P_14_2 + P_14_3 + P_14_4 + P_14_5
+    vat_total = Decimal("0")
+    for i in range(1, 6):
+        val = _xml_find(root, f".//Fa/P_14_{i}")
+        if val:
+            vat_total += Decimal(val)
+
+    return {
+        "seller_nip": seller_nip,
+        "seller_name": seller_name,
+        "seller_addr1": seller_addr1,
+        "seller_addr2": seller_addr2,
+        "seller_account": seller_account,
+        "buyer_nip": buyer_nip,
+        "buyer_name": buyer_name,
+        "buyer_addr1": buyer_addr1,
+        "buyer_addr2": buyer_addr2,
+        "invoice_number": invoice_number,
+        "invoice_date": invoice_date,
+        "due_date": due_date,
+        "gross_total": gross_total,
+        "vat_total": str(vat_total),
+        "is_split_payment": is_split_payment,
+    }
+
+
+def _elixir_text(name, addr1="", addr2=""):
+    """
+    Formatuje nazwę + adres w stylu Elixir-0: do 4 sekcji × 35 znaków, separator '|'.
+    """
+    parts = [p[:35] for p in [name, addr1, addr2] if p]
+    while len(parts) < 4:
+        parts.append("")
+    return "|".join(parts[:4])
+
+
+def _elixir_title_with_pipes(title_text):
+    """
+    Wstawia separator '|' co 35 znaków w tytule przelewu (wymaganie formatu 4×35).
+    """
+    result = ""
+    pos = 0
+    for ch in title_text:
+        if pos > 0 and pos % 35 == 0:
+            result += "|"
+        result += ch
+        pos += 1
+    return result
+
+
+def _amount_to_grosze(amount_str):
+    """Konwertuje kwotę (str z kropką dziesiętną) na grosze (int)."""
+    d = Decimal(amount_str)
+    return int((d * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _bank_clearing(nrb):
+    """Wyciąga 8-cyfrowy numer rozliczeniowy banku z 26-cyfrowego NRB."""
+    nrb_clean = re.sub(r"[^0-9]", "", nrb)
+    if len(nrb_clean) >= 10:
+        return nrb_clean[2:10]
+    return "0"
+
+
+def _date_elixir(date_str):
+    """Konwertuje datę ISO (YYYY-MM-DD) na format Elixir (YYYYMMDD)."""
+    return date_str.replace("-", "")[:8] if date_str else ""
+
+
+def _build_split_payment_title(vat_amount_str, seller_nip, invoice_number):
+    """
+    Buduje tytuł przelewu split payment (MPP) ze znacznikami /VAT/ /IDC/ /INV/.
+    Kwota VAT z przecinkiem jako separator dziesiętny (polska konwencja).
+    """
+    vat = Decimal(vat_amount_str)
+    vat_fmt = f"{vat:.2f}".replace(".", ",")
+    raw = f"/VAT/{vat_fmt}/IDC/{seller_nip}/INV/{invoice_number}"
+    return _elixir_title_with_pipes(raw)
+
+
+def generate_elixir_line(invoice_data, sender_account, execution_date=None):
+    """
+    Generuje linię w formacie Elixir-0 (15 pól, standard mBank).
+
+    Args:
+        invoice_data: dict z _parse_ksef_invoice()
+        sender_account: NRB rachunku nadawcy (kupującego), 26 cyfr
+        execution_date: data realizacji YYYYMMDD lub YYYY-MM-DD
+                        (domyślnie: termin płatności z faktury lub dziś)
+    """
+    # Data realizacji
+    if execution_date:
+        exec_date = _date_elixir(execution_date)
+    elif invoice_data["due_date"]:
+        exec_date = _date_elixir(invoice_data["due_date"])
+    else:
+        exec_date = date.today().strftime("%Y%m%d")
+
+    # Kwota w groszach
+    amount = _amount_to_grosze(invoice_data["gross_total"])
+
+    # Numery rozliczeniowe banków
+    sender_clearing = _bank_clearing(sender_account)
+    recipient_account = invoice_data["seller_account"]
+    recipient_clearing = _bank_clearing(recipient_account) if recipient_account else "0"
+
+    # Nazwa + adres nadawcy (kupujący)
+    sender_name = _elixir_text(
+        invoice_data["buyer_name"],
+        invoice_data["buyer_addr1"],
+        invoice_data["buyer_addr2"],
+    )
+
+    # Nazwa + adres odbiorcy (sprzedawca)
+    recipient_name = _elixir_text(
+        invoice_data["seller_name"],
+        invoice_data["seller_addr1"],
+        invoice_data["seller_addr2"],
+    )
+
+    # Tytuł przelewu i typ transakcji
+    if invoice_data["is_split_payment"]:
+        title = _build_split_payment_title(
+            invoice_data["vat_total"],
+            invoice_data["seller_nip"],
+            invoice_data["invoice_number"],
+        )
+        tx_type = "53"  # split payment / MPP
+    else:
+        raw_title = f"Zaplata za fakture {invoice_data['invoice_number']}"
+        title = _elixir_title_with_pipes(raw_title)
+        tx_type = "51"  # przelew zwykły
+
+    # Budowanie rekordu Elixir-0 (15 pól)
+    fields = [
+        "110",                      # 1  typ komunikatu (polecenie przelewu)
+        exec_date,                  # 2  data realizacji (YYYYMMDD)
+        str(amount),                # 3  kwota w groszach
+        sender_clearing,            # 4  nr rozliczeniowy banku nadawcy
+        "0",                        # 5  numer klienta
+        f'"{sender_account}"',      # 6  rachunek nadawcy (NRB 26 cyfr)
+        f'"{recipient_account}"',   # 7  rachunek odbiorcy (NRB 26 cyfr)
+        f'"{sender_name}"',         # 8  nazwa i adres nadawcy
+        f'"{recipient_name}"',      # 9  nazwa i adres odbiorcy
+        "0",                        # 10 dodatkowy identyfikator
+        recipient_clearing,         # 11 nr rozliczeniowy banku odbiorcy
+        f'"{title}"',               # 12 tytuł przelewu
+        '""',                       # 13 puste (zarezerwowane)
+        '""',                       # 14 puste (zarezerwowane)
+        f'"{tx_type}"',             # 15 kod klasyfikacji (51/53)
+    ]
+
+    return ",".join(fields)
+
+
+# =============================================================
+#  ENDPOINT:  POST /ksef/invoice-to-elixir
+# =============================================================
+@app.route("/ksef/invoice-to-elixir", methods=["POST"])
+def ksef_invoice_to_elixir():
+    """
+    Konwertuje fakturę KSeF (XML) na linię przelewu w formacie Elixir-0 (mBank).
+
+    Body (JSON):
+    {
+      "xml": "<Faktura ...>...</Faktura>",
+      "senderAccount": "12345678901234567890123456",   // NRB rachunku płatnika
+      "executionDate": "2026-03-01"                    // opcjonalne
+    }
+
+    Odpowiedź (JSON):
+    {
+      "elixir": "110,20260301,15000,...,\"51\"",
+      "invoiceNumber": "FV/2026/03/001",
+      "grossTotal": "150.00",
+      "vatTotal": "28.05",
+      "isSplitPayment": false,
+      "transactionType": "51"
+    }
+    """
+    auth_error = _check_api_key()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(force=True)
+    xml_string = body.get("xml", "")
+    sender_account = body.get("senderAccount", "")
+    execution_date = body.get("executionDate")
+
+    if not xml_string:
+        return jsonify({"error": "Wymagane pole: xml (faktura KSeF)"}), 400
+    if not sender_account:
+        return jsonify({"error": "Wymagane pole: senderAccount (NRB rachunku płatnika)"}), 400
+
+    # Walidacja NRB (26 cyfr)
+    sender_clean = re.sub(r"[^0-9]", "", sender_account)
+    if len(sender_clean) != 26:
+        return jsonify({"error": f"senderAccount musi mieć 26 cyfr (podano {len(sender_clean)})"}), 400
+
+    try:
+        invoice_data = _parse_ksef_invoice(xml_string)
+
+        if not invoice_data["seller_account"]:
+            return jsonify({
+                "error": "Brak rachunku bankowego sprzedawcy w fakturze "
+                         "(Fa/Platnosc/RachunekBankowy/NrRB)"
+            }), 422
+
+        elixir_line = generate_elixir_line(
+            invoice_data, sender_clean, execution_date
+        )
+
+        tx_type = "53" if invoice_data["is_split_payment"] else "51"
+
+        return jsonify({
+            "elixir": elixir_line,
+            "invoiceNumber": invoice_data["invoice_number"],
+            "grossTotal": invoice_data["gross_total"],
+            "vatTotal": invoice_data["vat_total"],
+            "isSplitPayment": invoice_data["is_split_payment"],
+            "transactionType": tx_type,
+            "sellerNip": invoice_data["seller_nip"],
+            "sellerName": invoice_data["seller_name"],
+            "sellerAccount": invoice_data["seller_account"],
+        })
+
+    except ET.ParseError as e:
+        return jsonify({"error": f"Nieprawidłowy XML: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check dla Render."""
@@ -246,9 +545,10 @@ if __name__ == "__main__":
     print(f"KSeF Token Server - http://localhost:{port}")
     print("=" * 60)
     print("\nEndpointy:")
-    print("  POST /ksef/token    - pobierz accessToken (nip + token)")
-    print("  POST /ksef/refresh  - odśwież accessToken (refreshToken)")
-    print("  GET  /health        - health check")
+    print("  POST /ksef/token             - pobierz accessToken (nip + token)")
+    print("  POST /ksef/refresh           - odśwież accessToken (refreshToken)")
+    print("  POST /ksef/invoice-to-elixir - konwersja faktury XML → Elixir-0")
+    print("  GET  /health                 - health check")
     if API_KEY:
         print(f"\n  API Key: ustawiony (nagłówek X-API-Key)")
     else:
