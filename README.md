@@ -5,7 +5,8 @@ Serwer API do integracji z **Krajowym Systemem e-Faktur (KSeF 2.0)**.
 Udostępnia endpointy do:
 - autoryzacji tokenem KSeF i pobierania tokenów JWT (accessToken / refreshToken),
 - odświeżania accessToken,
-- konwersji faktury KSeF (XML) na format przelewu **Elixir-0** (mBank i inne banki).
+- konwersji faktury KSeF (XML) na format przelewu **Elixir-0** (mBank i inne banki),
+- generowania **PDF faktury** z kodem QR na podstawie XML KSeF.
 
 ---
 
@@ -180,7 +181,41 @@ Automatycznie rozróżnia **przelew zwykły** (`"51"`) i **split payment / MPP**
 
 ---
 
-## Format Elixir-0 — opis pól
+### `POST /ksef/invoice-pdf`
+
+Generuje **PDF faktury** w polskim standardzie z kodem QR na podstawie XML faktury KSeF (schemat FA(2)).
+
+PDF zawiera:
+- kod QR (z linkiem weryfikacyjnym KSeF lub danymi faktury),
+- dane sprzedawcy i nabywcy,
+- tabelę pozycji,
+- podsumowanie VAT wg stawek,
+- kwotę do zapłaty (cyfrowo i słownie),
+- pola na podpisy.
+
+**Body (JSON):**
+```json
+{
+  "xml": "<Faktura xmlns=\"http://crd.gov.pl/wzor/2023/06/29/12648/\">...</Faktura>",
+  "ksefNumber": "1234567890-20260227-AB1234-56",
+  "issuerName": "Jan Kowalski"
+}
+```
+
+| Pole          | Typ    | Wymagane | Opis |
+|---------------|--------|----------|------|
+| `xml`         | string | ✅       | Pełny XML faktury KSeF (schemat FA(2)) |
+| `ksefNumber`  | string | ❌       | Numer KSeF faktury — umieszczany w kodzie QR jako link weryfikacyjny. Jeśli brak, QR zawiera podstawowe dane faktury. |
+| `issuerName`  | string | ❌       | Imię i nazwisko wystawcy (w polu podpisu) |
+
+**Odpowiedź (200):** plik PDF (`application/pdf`)
+
+**Błędy:**
+- `400` — brak XML lub nieprawidłowy XML
+- `401` — nieprawidłowy API key
+- `500` — inny błąd
+
+---
 
 Rekord Elixir-0 to jedna linia CSV z 15 polami oddzielonymi przecinkami:
 
@@ -251,6 +286,7 @@ Serwer odczytuje dane z faktury KSeF (schemat FA(2), namespace `http://crd.gov.p
 
 - **Python 3.9+** / Flask
 - **cryptography** — szyfrowanie RSA (OAEP/SHA-256) przy autoryzacji KSeF
+- **reportlab** — generowanie PDF faktur
 - **gunicorn** — serwer WSGI (produkcja)
 - Deploy: **Render** (free tier, konfiguracja w `render.yaml`)
 

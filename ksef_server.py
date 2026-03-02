@@ -24,7 +24,7 @@ Endpoint:
     }
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography import x509
@@ -36,6 +36,21 @@ import re
 import xml.etree.ElementTree as ET
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date
+import io
+
+# PDF generation (reportlab)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm as MM
+from reportlab.lib import colors as rl_colors
+from reportlab.pdfgen import canvas as pdf_canvas
+from reportlab.platypus import Table, TableStyle, Paragraph
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.graphics.barcode.qr import QrCodeWidget
+from reportlab.graphics import renderPDF
+from reportlab.graphics.shapes import Drawing
 
 app = Flask(__name__)
 
@@ -48,6 +63,37 @@ HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
+
+# --- PDF: rejestracja czcionek z obsługą polskich znaków ---
+_PDF_FONT = "Helvetica"
+_PDF_FONT_BOLD = "Helvetica-Bold"
+
+
+def _init_pdf_fonts():
+    """Rejestruje czcionkę TTF z polskimi znakami (DejaVu Sans)."""
+    global _PDF_FONT, _PDF_FONT_BOLD
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/System/Library/Fonts/Supplemental/Arial.ttf",
+         "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    ]
+    for regular, bold in candidates:
+        if os.path.exists(regular):
+            try:
+                pdfmetrics.registerFont(TTFont("InvFont", regular))
+                _PDF_FONT = "InvFont"
+                if os.path.exists(bold):
+                    pdfmetrics.registerFont(TTFont("InvFont-Bold", bold))
+                    _PDF_FONT_BOLD = "InvFont-Bold"
+                else:
+                    _PDF_FONT_BOLD = "InvFont"
+                return
+            except Exception:
+                continue
+
+
+_init_pdf_fonts()
 
 
 def _check_api_key():
@@ -533,6 +579,584 @@ def ksef_invoice_to_elixir():
         return jsonify({"error": str(e)}), 500
 
 
+# =============================================================
+#  KSeF XML → PDF — funkcje pomocnicze
+# =============================================================
+
+def _format_amount_pl(amount_str):
+    """'38224.71' → '38 224,71' (polski format kwoty)."""
+    d = Decimal(str(amount_str)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    text = f"{d:.2f}"
+    int_part, dec_part = text.split(".")
+    negative = int_part.startswith("-")
+    int_part = int_part.lstrip("-")
+    result = ""
+    for i, ch in enumerate(reversed(int_part)):
+        if i > 0 and i % 3 == 0:
+            result = "\u00a0" + result  # non-breaking space
+        result = ch + result
+    if negative:
+        result = "-" + result
+    return f"{result},{dec_part}"
+
+
+def _format_nrb(nrb):
+    """'70114020040000300284647155' → '70 1140 2004 0000 3002 8464 7155'."""
+    clean = re.sub(r"[^0-9]", "", nrb)
+    if len(clean) != 26:
+        return nrb
+    return (f"{clean[:2]} {clean[2:6]} {clean[6:10]} {clean[10:14]} "
+            f"{clean[14:18]} {clean[18:22]} {clean[22:26]}")
+
+
+def _number_to_words_pl(n):
+    """Konwertuje liczbę całkowitą (≥0) na słowa po polsku."""
+    if n == 0:
+        return "zero"
+    ones = ["", "jeden", "dwa", "trzy", "cztery", "pięć",
+            "sześć", "siedem", "osiem", "dziewięć"]
+    teens = ["dziesięć", "jedenaście", "dwanaście", "trzynaście",
+             "czternaście", "piętnaście", "szesnaście", "siedemnaście",
+             "osiemnaście", "dziewiętnaście"]
+    tens_w = ["", "dziesięć", "dwadzieścia", "trzydzieści", "czterdzieści",
+              "pięćdziesiąt", "sześćdziesiąt", "siedemdziesiąt",
+              "osiemdziesiąt", "dziewięćdziesiąt"]
+    hundreds_w = ["", "sto", "dwieście", "trzysta", "czterysta", "pięćset",
+                  "sześćset", "siedemset", "osiemset", "dziewięćset"]
+
+    def _group(g):
+        if g == 0:
+            return ""
+        parts = []
+        if g // 100:
+            parts.append(hundreds_w[g // 100])
+        rest = g % 100
+        if 10 <= rest < 20:
+            parts.append(teens[rest - 10])
+        else:
+            if rest // 10:
+                parts.append(tens_w[rest // 10])
+            if rest % 10:
+                parts.append(ones[rest % 10])
+        return " ".join(parts)
+
+    def _plural(count, s1, s24, s5p):
+        if count == 1:
+            return s1
+        lt = count % 100
+        lo = count % 10
+        if 10 < lt < 20:
+            return s5p
+        if 2 <= lo <= 4:
+            return s24
+        return s5p
+
+    scales = [
+        (1_000_000_000, "miliard", "miliardy", "miliardów"),
+        (1_000_000, "milion", "miliony", "milionów"),
+        (1_000, "tysiąc", "tysiące", "tysięcy"),
+    ]
+    parts = []
+    for divisor, s1, s24, s5p in scales:
+        count = n // divisor
+        n %= divisor
+        if count == 0:
+            continue
+        form = _plural(count, s1, s24, s5p)
+        if count == 1:
+            parts.append(form)
+        else:
+            parts.append(f"{_group(count)} {form}")
+    if n > 0:
+        parts.append(_group(n))
+    return " ".join(parts)
+
+
+def _amount_to_words_pl(amount_str):
+    """'38224.71' → 'trzydzieści osiem tysięcy dwieście dwadzieścia cztery PLN 71/100'."""
+    d = Decimal(str(amount_str)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    integer = int(d)
+    decimal = int(round(abs(d - integer) * 100))
+    words = _number_to_words_pl(abs(integer))
+    return f"{words} PLN {decimal:02d}/100"
+
+
+def _parse_ksef_invoice_for_pdf(xml_string):
+    """
+    Rozszerzony parser faktury KSeF FA(2) — z pozycjami i podsumowaniem VAT.
+    """
+    root = _strip_namespaces(xml_string)
+
+    seller_nip = _xml_find(root, ".//Podmiot1/DaneIdentyfikacyjne/NIP")
+    seller_name = _xml_find(root, ".//Podmiot1/DaneIdentyfikacyjne/Nazwa")
+    seller_addr1 = _xml_find(root, ".//Podmiot1/Adres/AdresL1")
+    seller_addr2 = _xml_find(root, ".//Podmiot1/Adres/AdresL2")
+    seller_phone = _xml_find(root, ".//Podmiot1/DaneKontaktowe/Telefon")
+
+    buyer_nip = _xml_find(root, ".//Podmiot2/DaneIdentyfikacyjne/NIP")
+    buyer_name = _xml_find(root, ".//Podmiot2/DaneIdentyfikacyjne/Nazwa")
+    buyer_addr1 = _xml_find(root, ".//Podmiot2/Adres/AdresL1")
+    buyer_addr2 = _xml_find(root, ".//Podmiot2/Adres/AdresL2")
+
+    invoice_number = _xml_find(root, ".//Fa/P_2")
+    invoice_date = _xml_find(root, ".//Fa/P_1")
+    sale_date = _xml_find(root, ".//Fa/P_6") or invoice_date
+    gross_total = _xml_find(root, ".//Fa/P_15", "0")
+    due_date = _xml_find(root, ".//Fa/Platnosc/TerminPlatnosci/Termin")
+    seller_account = _xml_find(root, ".//Fa/Platnosc/RachunekBankowy/NrRB")
+
+    mpp_flag = _xml_find(root, ".//Fa/Adnotacje/P_18A", "2")
+    is_split_payment = (mpp_flag == "1")
+
+    vat_total = Decimal("0")
+    for i in range(1, 6):
+        val = _xml_find(root, f".//Fa/P_14_{i}")
+        if val:
+            vat_total += Decimal(val)
+
+    # --- Pozycje (FaWiersz) ---
+    line_items = []
+    vat_summary = {}  # rate_display -> {net, vat, gross}
+
+    for row in root.findall(".//Fa/FaWiersz"):
+        nr = _xml_find(row, "NrWierszFa", str(len(line_items) + 1))
+        name = _xml_find(row, "P_7")
+        unit = _xml_find(row, "P_8A")
+        qty = Decimal(_xml_find(row, "P_8B", "1"))
+        price_net = Decimal(_xml_find(row, "P_9A", "0"))
+        net = Decimal(_xml_find(row, "P_11", "0"))
+        rate_str = _xml_find(row, "P_12", "0")
+
+        try:
+            rate = Decimal(rate_str)
+            vat_amt = (net * rate / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            rate_display = f"{int(rate)}%"
+        except Exception:
+            vat_amt = Decimal("0")
+            rate_display = rate_str
+
+        gross = net + vat_amt
+
+        qty_display = str(int(qty)) if qty == int(qty) else _format_amount_pl(str(qty))
+
+        line_items.append({
+            "nr": nr, "name": name, "qty": qty_display, "unit": unit,
+            "price_net": str(price_net), "net": str(net),
+            "rate": rate_display, "vat": str(vat_amt), "gross": str(gross),
+        })
+
+        if rate_display not in vat_summary:
+            vat_summary[rate_display] = {"net": Decimal("0"), "vat": Decimal("0"), "gross": Decimal("0")}
+        vat_summary[rate_display]["net"] += net
+        vat_summary[rate_display]["vat"] += vat_amt
+        vat_summary[rate_display]["gross"] += gross
+
+    net_total = sum(Decimal(it["net"]) for it in line_items) if line_items else Decimal("0")
+    paid = Decimal(_xml_find(root, ".//Fa/Platnosc/Zaplacono") or "0")
+
+    return {
+        "seller_nip": seller_nip, "seller_name": seller_name,
+        "seller_addr1": seller_addr1, "seller_addr2": seller_addr2,
+        "seller_phone": seller_phone, "seller_account": seller_account,
+        "buyer_nip": buyer_nip, "buyer_name": buyer_name,
+        "buyer_addr1": buyer_addr1, "buyer_addr2": buyer_addr2,
+        "invoice_number": invoice_number, "invoice_date": invoice_date,
+        "sale_date": sale_date, "due_date": due_date,
+        "gross_total": gross_total, "net_total": str(net_total),
+        "vat_total": str(vat_total), "is_split_payment": is_split_payment,
+        "line_items": line_items,
+        "vat_summary": {k: {kk: str(vv) for kk, vv in v.items()} for k, v in vat_summary.items()},
+        "paid": str(paid),
+    }
+
+
+# =============================================================
+#  Generowanie PDF faktury
+# =============================================================
+
+def _generate_invoice_pdf(inv, ksef_number=None, issuer_name=None):
+    """
+    Generuje PDF faktury w polskim standardzie z kodem QR.
+
+    Args:
+        inv: dict z _parse_ksef_invoice_for_pdf()
+        ksef_number: opcjonalny numer KSeF (do weryfikacji QR)
+        issuer_name: imię i nazwisko wystawcy (podpis)
+
+    Returns:
+        bytes — dokument PDF
+    """
+    buf = io.BytesIO()
+    W, H = A4
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+
+    F = _PDF_FONT
+    FB = _PDF_FONT_BOLD
+    LEFT = 15 * MM
+    RIGHT = W - 15 * MM
+    PW = RIGHT - LEFT
+
+    y = H - 12 * MM
+
+    # ─── QR CODE ─────────────────────────────────────────────
+    qr_size = 25 * MM
+    if ksef_number:
+        qr_data = f"https://ksef.mf.gov.pl/web/verify/{ksef_number}"
+    else:
+        qr_data = (f"FV:{inv['invoice_number']}|NIP:{inv['seller_nip']}"
+                   f"|KWOTA:{inv['gross_total']}")
+
+    qr_w = QrCodeWidget(qr_data)
+    qr_w.barWidth = qr_size
+    qr_w.barHeight = qr_size
+    drawing = Drawing(qr_size, qr_size)
+    drawing.add(qr_w)
+    renderPDF.draw(drawing, c, LEFT, y - qr_size)
+
+    c.setFont(F, 6.5)
+    qr_label = ksef_number if ksef_number else "OFFLINE"
+    c.drawCentredString(LEFT + qr_size / 2, y - qr_size - 8, qr_label)
+
+    # ─── HEADER: pieczęć firmy + Faktura + Nr / daty ─────────
+    hdr_top = y
+    stamp_x = LEFT + qr_size + 8 * MM
+    stamp_w = 55 * MM
+    stamp_h = 38 * MM
+
+    # Gray "pieczęć firmy" box
+    c.setFillColor(rl_colors.Color(0.93, 0.93, 0.93))
+    c.rect(stamp_x, hdr_top - stamp_h, stamp_w, stamp_h, fill=1, stroke=0)
+
+    c.setFillColor(rl_colors.black)
+    c.setFont(FB, 22)
+    c.drawCentredString(stamp_x + stamp_w / 2, hdr_top - stamp_h / 2, "Faktura")
+
+    c.setFont(F, 7)
+    c.setFillColor(rl_colors.Color(0.5, 0.5, 0.5))
+    c.drawCentredString(stamp_x + stamp_w / 2, hdr_top - stamp_h + 5,
+                        "pieczęć firmy")
+    c.setFillColor(rl_colors.black)
+
+    # Right boxes: Nr, Data wystawienia, Data sprzedaży
+    rx = stamp_x + stamp_w + 4 * MM
+    rw = RIGHT - rx
+    bh = 12 * MM
+
+    c.setStrokeColor(rl_colors.Color(0.75, 0.75, 0.75))
+    c.setLineWidth(0.5)
+
+    # Nr
+    c.rect(rx, hdr_top - bh, rw, bh, stroke=1, fill=0)
+    c.setFont(FB, 9)
+    c.drawCentredString(rx + rw / 2, hdr_top - bh / 2 - 3,
+                        f"Nr {inv['invoice_number']}")
+
+    # Data wystawienia
+    dy = hdr_top - bh - 1 * MM
+    c.rect(rx, dy - bh, rw, bh, stroke=1, fill=0)
+    c.setFont(FB, 9)
+    c.drawCentredString(rx + rw / 2, dy - bh / 2 + 1, inv["invoice_date"])
+    c.setFont(F, 6.5)
+    c.drawCentredString(rx + rw / 2, dy - bh / 2 - 8, "Data wystawienia")
+
+    # Data sprzedaży
+    sy = dy - bh - 1 * MM
+    c.rect(rx, sy - bh, rw, bh, stroke=1, fill=0)
+    c.setFont(FB, 9)
+    c.drawCentredString(rx + rw / 2, sy - bh / 2 + 1, inv["sale_date"])
+    c.setFont(F, 6.5)
+    c.drawCentredString(rx + rw / 2, sy - bh / 2 - 8, "Data sprzedaży")
+
+    y = hdr_top - max(stamp_h + 10, 3 * bh + 4 * MM) - 6 * MM
+
+    # ─── SELLER / BUYER ─────────────────────────────────────
+    half_w = PW / 2 - 2 * MM
+    box_h = 24 * MM
+
+    c.setStrokeColor(rl_colors.Color(0.75, 0.75, 0.75))
+    c.setLineWidth(0.5)
+
+    # Seller (left)
+    c.rect(LEFT, y - box_h, half_w, box_h, stroke=1, fill=0)
+    tx = LEFT + 3 * MM
+    ty = y - 5 * MM
+    c.setFont(F, 8)
+    c.drawString(tx, ty, f"Sprzedawca: {inv['seller_name']}")
+    ty -= 10
+    addr = inv['seller_addr1']
+    if inv['seller_addr2']:
+        addr += f", {inv['seller_addr2']}"
+    c.drawString(tx, ty, f"Adres: {addr}")
+    ty -= 10
+    c.drawString(tx, ty, f"NIP: {inv['seller_nip']}")
+    if inv.get('seller_phone'):
+        ty -= 10
+        c.drawString(tx, ty, f"Numer telefonu: {inv['seller_phone']}")
+
+    # Buyer (right)
+    bx = LEFT + half_w + 4 * MM
+    c.rect(bx, y - box_h, half_w, box_h, stroke=1, fill=0)
+    tx = bx + 3 * MM
+    ty = y - 5 * MM
+    c.setFont(F, 8)
+    c.drawString(tx, ty, f"Nabywca: {inv['buyer_name']}")
+    ty -= 10
+    addr = inv['buyer_addr1']
+    if inv['buyer_addr2']:
+        addr += f", {inv['buyer_addr2']}"
+    c.drawString(tx, ty, f"Adres: {addr}")
+    ty -= 10
+    c.drawString(tx, ty, f"NIP: {inv['buyer_nip']}")
+
+    y -= box_h + 4 * MM
+
+    # ─── PAYMENT INFO ───────────────────────────────────────
+    pay_h = 16 * MM
+    c.rect(LEFT, y - pay_h, PW, pay_h, stroke=1, fill=0)
+    tx = LEFT + 3 * MM
+    ty = y - 5 * MM
+
+    c.setFont(F, 8)
+    lbl = "Sposób płatności: "
+    c.drawString(tx, ty, lbl)
+    c.setFont(FB, 8)
+    c.drawString(tx + c.stringWidth(lbl, F, 8), ty, "Przelew")
+
+    lbl2 = "Termin płatności: "
+    due_x = tx + 55 * MM
+    c.setFont(F, 8)
+    c.drawString(due_x, ty, lbl2)
+    c.setFont(FB, 8)
+    c.drawString(due_x + c.stringWidth(lbl2, F, 8), ty,
+                 inv["due_date"] or "-")
+
+    ty -= 12
+    c.setFont(F, 8)
+    if inv["seller_account"]:
+        lbl3 = "Numer konta: "
+        c.drawString(tx, ty, lbl3)
+        c.setFont(FB, 8)
+        c.drawString(tx + c.stringWidth(lbl3, F, 8), ty,
+                     _format_nrb(inv["seller_account"]))
+
+    y -= pay_h + 4 * MM
+
+    # ─── LINE ITEMS TABLE ───────────────────────────────────
+    col_mm = [10, 46, 14, 12, 22, 22, 14, 18, 22]
+    col_w = [w * MM for w in col_mm]
+    total_col = sum(col_w)
+    scale = PW / total_col
+    col_w = [w * scale for w in col_w]
+
+    hdr_para = ParagraphStyle('H', fontName=FB, fontSize=7, leading=8.5,
+                              alignment=TA_CENTER)
+    cell_r = ParagraphStyle('CR', fontName=F, fontSize=7.5, leading=9,
+                            alignment=TA_RIGHT)
+    cell_l = ParagraphStyle('CL', fontName=F, fontSize=7.5, leading=9,
+                            alignment=TA_LEFT)
+    cell_c = ParagraphStyle('CC', fontName=F, fontSize=7.5, leading=9,
+                            alignment=TA_CENTER)
+
+    header_row = [
+        Paragraph("Lp.", hdr_para),
+        Paragraph("Nazwa", hdr_para),
+        Paragraph("Ilość", hdr_para),
+        Paragraph("Jm", hdr_para),
+        Paragraph("Cena netto", hdr_para),
+        Paragraph("Wartość<br/>netto", hdr_para),
+        Paragraph("Stawka<br/>VAT", hdr_para),
+        Paragraph("Kwota VAT", hdr_para),
+        Paragraph("Wartość<br/>brutto", hdr_para),
+    ]
+
+    data_rows = []
+    for item in inv["line_items"]:
+        data_rows.append([
+            Paragraph(item["nr"], cell_c),
+            Paragraph(item["name"], cell_l),
+            Paragraph(item["qty"], cell_r),
+            Paragraph(item["unit"], cell_c),
+            Paragraph(_format_amount_pl(item["price_net"]), cell_r),
+            Paragraph(_format_amount_pl(item["net"]), cell_r),
+            Paragraph(item["rate"], cell_c),
+            Paragraph(_format_amount_pl(item["vat"]), cell_r),
+            Paragraph(_format_amount_pl(item["gross"]), cell_r),
+        ])
+
+    tbl_data = [header_row] + data_rows
+    t = Table(tbl_data, colWidths=col_w)
+    t.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.Color(0.75, 0.75, 0.75)),
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.Color(0.93, 0.93, 0.93)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+    ]))
+
+    tw, th = t.wrap(PW, 0)
+    t.drawOn(c, LEFT, y - th)
+    y -= th + 2 * MM
+
+    # ─── SUMMARY ROWS (Razem / W tym) ───────────────────────
+    sum_hdr = ParagraphStyle('SH', fontName=FB, fontSize=7.5, leading=9,
+                             alignment=TA_RIGHT)
+    sum_cell = ParagraphStyle('SC', fontName=F, fontSize=7.5, leading=9,
+                              alignment=TA_RIGHT)
+    sum_cell_c = ParagraphStyle('SCC', fontName=F, fontSize=7.5, leading=9,
+                                alignment=TA_CENTER)
+
+    net_d = Decimal(inv["net_total"])
+    vat_d = Decimal(inv["vat_total"])
+
+    sum_rows = [[
+        Paragraph("Razem:", sum_hdr),
+        Paragraph(_format_amount_pl(str(net_d)), sum_cell),
+        Paragraph("X", sum_cell_c),
+        Paragraph(_format_amount_pl(str(vat_d)), sum_cell),
+        Paragraph(_format_amount_pl(inv["gross_total"]), sum_cell),
+    ]]
+    for rate_str in sorted(inv["vat_summary"].keys()):
+        vals = inv["vat_summary"][rate_str]
+        sum_rows.append([
+            Paragraph("W tym:", sum_hdr),
+            Paragraph(_format_amount_pl(vals["net"]), sum_cell),
+            Paragraph(rate_str, sum_cell_c),
+            Paragraph(_format_amount_pl(vals["vat"]), sum_cell),
+            Paragraph(_format_amount_pl(vals["gross"]), sum_cell),
+        ])
+
+    sum_col_w = [18 * MM, 22 * MM, 14 * MM, 18 * MM, 22 * MM]
+    st = Table(sum_rows, colWidths=sum_col_w)
+    st.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.Color(0.75, 0.75, 0.75)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    stw, sth = st.wrap(0, 0)
+    st.drawOn(c, RIGHT - stw, y - sth)
+    y -= sth + 5 * MM
+
+    # ─── RAZEM DO ZAPŁATY ───────────────────────────────────
+    gross_d = Decimal(inv["gross_total"])
+    paid = Decimal(inv.get("paid", "0"))
+    remaining = gross_d - paid
+
+    box_h3 = 20 * MM
+    c.setStrokeColor(rl_colors.Color(0.75, 0.75, 0.75))
+    c.rect(LEFT, y - box_h3, PW, box_h3, stroke=1, fill=0)
+
+    tx = LEFT + 3 * MM
+    ty = y - 6 * MM
+    c.setFont(F, 9)
+    lbl = "Razem do zapłaty: "
+    c.drawString(tx, ty, lbl)
+    c.setFont(FB, 12)
+    c.drawString(tx + c.stringWidth(lbl, F, 9), ty,
+                 f"{_format_amount_pl(inv['gross_total'])} PLN")
+
+    ty -= 13
+    c.setFont(F, 8)
+    c.drawString(tx, ty,
+                 f"Zapłacono: {_format_amount_pl(str(paid))} PLN")
+    ty -= 10
+    c.drawString(tx, ty,
+                 f"Pozostało do zapłaty: {_format_amount_pl(str(remaining))} PLN")
+
+    y -= box_h3 + 4 * MM
+
+    # ─── SŁOWNIE ────────────────────────────────────────────
+    words_h = 12 * MM
+    c.rect(LEFT, y - words_h, PW, words_h, stroke=1, fill=0)
+    tx = LEFT + 3 * MM
+    ty = y - 5 * MM
+    c.setFont(F, 8)
+    words = _amount_to_words_pl(inv["gross_total"])
+    c.drawString(tx, ty, f"Słownie: {words}")
+
+    y -= words_h + 6 * MM
+
+    # ─── PODPISY ────────────────────────────────────────────
+    sig_h = 30 * MM
+    half = PW / 2 - 3 * MM
+
+    # Left signature
+    c.rect(LEFT, y - sig_h, half, sig_h, stroke=1, fill=0)
+    c.setFont(F, 6.5)
+    c.drawCentredString(
+        LEFT + half / 2, y - sig_h + 12,
+        "imię, nazwisko i podpis osoby upoważnionej")
+    c.drawCentredString(
+        LEFT + half / 2, y - sig_h + 4,
+        "do odebrania dokumentu")
+
+    # Right signature
+    rx2 = LEFT + half + 6 * MM
+    c.rect(rx2, y - sig_h, half, sig_h, stroke=1, fill=0)
+    if issuer_name:
+        c.setFont(FB, 10)
+        c.drawCentredString(rx2 + half / 2, y - sig_h / 2 + 2, issuer_name)
+    c.setFont(F, 6.5)
+    c.drawCentredString(
+        rx2 + half / 2, y - sig_h + 12,
+        "imię, nazwisko i podpis osoby upoważnionej do wystawienia")
+    c.drawCentredString(rx2 + half / 2, y - sig_h + 4, "dokumentu")
+
+    # ─── FINALIZACJA ────────────────────────────────────────
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# =============================================================
+#  ENDPOINT:  POST /ksef/invoice-pdf
+# =============================================================
+@app.route("/ksef/invoice-pdf", methods=["POST"])
+def ksef_invoice_pdf():
+    """
+    Generuje PDF faktury z kodem QR na podstawie XML faktury KSeF.
+
+    Body (JSON):
+    {
+      "xml": "<Faktura ...>...</Faktura>",
+      "ksefNumber": "1234567890-20260227-...",   // opcjonalny
+      "issuerName": "Jan Kowalski"               // opcjonalny
+    }
+
+    Odpowiedź: application/pdf
+    """
+    auth_error = _check_api_key()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(force=True)
+    xml_string = body.get("xml", "")
+    ksef_number = body.get("ksefNumber")
+    issuer_name = body.get("issuerName")
+
+    if not xml_string:
+        return jsonify({"error": "Wymagane pole: xml (faktura KSeF)"}), 400
+
+    try:
+        inv = _parse_ksef_invoice_for_pdf(xml_string)
+        pdf_bytes = _generate_invoice_pdf(inv, ksef_number, issuer_name)
+
+        filename = f"faktura_{inv['invoice_number'].replace('/', '_')}.pdf"
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ET.ParseError as e:
+        return jsonify({"error": f"Nieprawidłowy XML: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check dla Render."""
@@ -548,6 +1172,7 @@ if __name__ == "__main__":
     print("  POST /ksef/token             - pobierz accessToken (nip + token)")
     print("  POST /ksef/refresh           - odśwież accessToken (refreshToken)")
     print("  POST /ksef/invoice-to-elixir - konwersja faktury XML → Elixir-0")
+    print("  POST /ksef/invoice-pdf       - generuj PDF faktury z QR")
     print("  GET  /health                 - health check")
     if API_KEY:
         print(f"\n  API Key: ustawiony (nagłówek X-API-Key)")
